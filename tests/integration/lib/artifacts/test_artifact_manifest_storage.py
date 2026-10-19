@@ -623,6 +623,41 @@ def test_project_adapter_retries_a_replace_refused_while_a_reader_holds_the_mani
         assert manifest.compare(key, artifact_path="episode_2.json", basis=basis).status is ArtifactStatus.CURRENT
 
 
+@pytest.mark.parametrize("refusals", [2, None], ids=("released", "held"))
+def test_project_adapter_retries_removing_the_emptied_manifest_while_a_reader_holds_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusals: int | None,
+) -> None:
+    """Deleting the last entry removes the Manifest, which Windows refuses the same way as a replace."""
+
+    project, _writer = _registered_script_project(tmp_path)
+    adapter = ProjectArtifactManifestAdapter(project, sleep=lambda _seconds: None)
+    manifest_path = project / MANIFEST_FILENAME
+    original_unlink = os.unlink
+    attempts: list[int] = []
+
+    def refuse_unlink(path: Any, **dir_fd: Any) -> None:
+        if os.fsdecode(path) in {MANIFEST_FILENAME, os.fsdecode(manifest_path)}:
+            attempts.append(1)
+            if refusals is None or len(attempts) <= refusals:
+                raise PermissionError(13, "sharing violation", os.fsdecode(path))
+        original_unlink(path, **dir_fd)
+
+    monkeypatch.setattr("lib.artifacts.artifact_manifest.os.unlink", refuse_unlink)
+    key = ArtifactKey.episode_script(1)
+
+    if refusals is None:
+        with pytest.raises(ArtifactManifestError, match="remove empty artifact manifest"):
+            adapter.delete_entry(key)
+        assert len(attempts) == len(MANIFEST_REPLACE_RETRY_DELAYS_SECONDS) + 1
+        assert manifest_path.exists()
+    else:
+        assert adapter.delete_entry(key)
+        assert len(attempts) == refusals + 1
+        assert not manifest_path.exists()
+
+
 @pytest.mark.parametrize("force_python_link_fallback", [False, True])
 def test_project_adapter_blocks_escape_and_symlink_artifact_paths(
     tmp_path: Path,

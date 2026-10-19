@@ -704,25 +704,25 @@ def reset_manifest_read_cache_for_tests() -> None:
 
 
 MANIFEST_REPLACE_RETRY_DELAYS_SECONDS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.4)
-"""Waits between Manifest replace attempts refused with ``PermissionError``."""
+"""Waits between Manifest replace or removal attempts refused with ``PermissionError``."""
 
 
-def _replace_with_retry(replace: Callable[[], None], sleep: Callable[[float], None]) -> None:
-    """Run one atomic replace, retrying briefly while the target is held open.
+def _retry_while_held_open(operation: Callable[[], None], sleep: Callable[[float], None]) -> None:
+    """Run one Manifest replace or removal, retrying briefly while the target is held open.
 
     Readers open the Manifest without the lock.  On Windows a reader's open
-    handle (opened without delete sharing) makes the replace fail with a sharing
-    violation, surfaced as ``PermissionError``, until the reader closes it a
-    moment later.  Exhausted retries re-raise the last error.
+    handle (opened without delete sharing) makes replacing or removing the file
+    fail with a sharing violation, surfaced as ``PermissionError``, until the
+    reader closes it a moment later.  Exhausted retries re-raise the last error.
     """
 
     for delay in MANIFEST_REPLACE_RETRY_DELAYS_SECONDS:
         try:
-            replace()
+            operation()
             return
         except PermissionError:
             sleep(delay)
-    replace()
+    operation()
 
 
 class ProjectArtifactManifestAdapter:
@@ -1277,15 +1277,7 @@ class ProjectArtifactManifestAdapter:
             if entries.pop(key.encode(), None) is None:
                 return False
             if not entries:
-                try:
-                    if root_fd is None:
-                        (self._project_dir / MANIFEST_FILENAME).unlink()
-                    else:
-                        os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)
-                except FileNotFoundError:
-                    return True
-                except OSError as exc:
-                    raise ArtifactManifestError(f"cannot remove empty artifact manifest: {exc}") from exc
+                self._remove_manifest_unlocked(root_fd)
                 return True
             new_bytes = _serialize_manifest(entries)
             if original_bytes == new_bytes:
@@ -1327,16 +1319,7 @@ class ProjectArtifactManifestAdapter:
                 else:
                     entries[key] = entry
             if not entries:
-                try:
-                    if root_fd is None:
-                        (self._project_dir / MANIFEST_FILENAME).unlink()
-                    else:
-                        os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)
-                except FileNotFoundError:
-                    # Deletion is idempotent; another writer may already have removed the empty sidecar.
-                    pass
-                except OSError as exc:
-                    raise ArtifactManifestError(f"cannot remove empty artifact manifest: {exc}") from exc
+                self._remove_manifest_unlocked(root_fd)
                 return original_bytes is not None
             new_bytes = _serialize_manifest(entries)
             if original_bytes == new_bytes:
@@ -1362,16 +1345,7 @@ class ProjectArtifactManifestAdapter:
             if current == encoded_replacement:
                 return True
             if not encoded_replacement:
-                try:
-                    if root_fd is None:
-                        (self._project_dir / MANIFEST_FILENAME).unlink()
-                    else:
-                        os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)
-                except FileNotFoundError:
-                    # Deletion is idempotent; another writer may already have removed the empty sidecar.
-                    pass
-                except OSError as exc:
-                    raise ArtifactManifestError(f"cannot remove empty artifact manifest: {exc}") from exc
+                self._remove_manifest_unlocked(root_fd)
                 return True
             if original_bytes == new_bytes:
                 return True
@@ -1639,6 +1613,21 @@ class ProjectArtifactManifestAdapter:
                 f"opened artifact manifest is unavailable: {self._project_dir / MANIFEST_FILENAME}: {exc}"
             ) from exc
 
+    def _remove_manifest_unlocked(self, root_fd: int | None) -> None:
+        def unlink() -> None:
+            if root_fd is None:
+                (self._project_dir / MANIFEST_FILENAME).unlink()
+            else:
+                os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)
+
+        try:
+            _retry_while_held_open(unlink, self._sleep)
+        except FileNotFoundError:
+            # Deletion is idempotent; another writer may already have removed the empty sidecar.
+            pass
+        except OSError as exc:
+            raise ArtifactManifestError(f"cannot remove empty artifact manifest: {exc}") from exc
+
     def _atomic_replace(self, content: bytes, root_fd: int | None) -> None:
         if root_fd is None:
             fd, tmp_name = tempfile.mkstemp(
@@ -1664,9 +1653,9 @@ class ProjectArtifactManifestAdapter:
                 handle.flush()
                 os.fsync(handle.fileno())
             if root_fd is None:
-                _replace_with_retry(lambda: os.replace(tmp_name, self._project_dir / MANIFEST_FILENAME), self._sleep)
+                _retry_while_held_open(lambda: os.replace(tmp_name, self._project_dir / MANIFEST_FILENAME), self._sleep)
             else:
-                _replace_with_retry(
+                _retry_while_held_open(
                     lambda: os.replace(tmp_name, MANIFEST_FILENAME, src_dir_fd=root_fd, dst_dir_fd=root_fd),
                     self._sleep,
                 )
