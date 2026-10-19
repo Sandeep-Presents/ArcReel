@@ -108,6 +108,10 @@ class ArtifactManifestError(RuntimeError):
     """Manifest storage cannot be read or safely updated."""
 
 
+class _RuntimeFileReplacedError(ArtifactManifestError):
+    """A runtime file was replaced or removed between its identity check and open."""
+
+
 class ArtifactRegistrationError(ArtifactManifestError):
     """A basis cannot be registered before its formal artifact is safely present."""
 
@@ -702,6 +706,9 @@ def reset_manifest_read_cache_for_tests() -> None:
 
     _MANIFEST_READ_CACHE.clear()
 
+
+MANIFEST_OPEN_RACE_RETRIES = 3
+"""Extra lock-free open attempts when a writer replaces the Manifest between identity checks."""
 
 MANIFEST_REPLACE_RETRY_DELAYS_SECONDS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.4)
 """Waits between Manifest replace or removal attempts refused with ``PermissionError``."""
@@ -1509,13 +1516,14 @@ class ProjectArtifactManifestAdapter:
             raise ArtifactManifestError(f"opened {label} is unavailable: {path}: {exc}") from exc
         current_identity = self._runtime_file_identity(path, label)
         opened_identity = (opened_stat.st_dev, opened_stat.st_ino)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ArtifactManifestError(f"{label} changed while it was being opened: {path}")
         if (
-            not stat.S_ISREG(opened_stat.st_mode)
-            or current_identity is None
+            current_identity is None
             or current_identity != opened_identity
             or (expected_identity is not None and current_identity != expected_identity)
         ):
-            raise ArtifactManifestError(f"{label} changed while it was being opened: {path}")
+            raise _RuntimeFileReplacedError(f"{label} changed while it was being opened: {path}")
 
     def _open_manifest(self, root_fd: int | None) -> BinaryIO | None:
         """Open the manifest after the same no-follow and identity checks; ``None`` when absent."""
@@ -1551,6 +1559,21 @@ class ProjectArtifactManifestAdapter:
                 os.close(fd)
             raise
 
+    def _open_manifest_racing_writers(self, root_fd: int | None) -> BinaryIO | None:
+        """Open for a lock-free read, retrying when a writer replaces the Manifest mid-open.
+
+        Without ``O_NOFOLLOW`` (Windows) the open is bracketed by identity checks, and a
+        writer's atomic replace landing between them looks like a swap.  Each retry
+        repeats every check on the file it actually opens.
+        """
+
+        for _ in range(MANIFEST_OPEN_RACE_RETRIES):
+            try:
+                return self._open_manifest(root_fd)
+            except _RuntimeFileReplacedError:
+                continue
+        return self._open_manifest(root_fd)
+
     def _read_open_manifest(self, handle: BinaryIO) -> bytes:
         try:
             return handle.read()
@@ -1582,7 +1605,7 @@ class ProjectArtifactManifestAdapter:
         changes during the read is never cached.
         """
 
-        handle = self._open_manifest(root_fd)
+        handle = self._open_manifest_racing_writers(root_fd)
         if handle is None:
             _MANIFEST_READ_CACHE.discard(self._project_identity)
             return None

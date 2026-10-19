@@ -38,7 +38,7 @@ class _GatedSummaries(_FakeSummaries):
 
     def get_project_summary(self, name, **kwargs):
         self.started.set()
-        assert self.gate.wait(timeout=10)
+        self.gate.wait()
         summary = super().get_project_summary(name, **kwargs)
         return summary.model_copy(update={"needs_repair": True, "repair_reason": "scripts/episode_1.json"})
 
@@ -196,11 +196,14 @@ class TestProjectsRouter:
                 return asyncio.create_task(client.get("/api/v1/projects/ready", headers={"Accept-Language": locale}))
 
             running = get("zh")
-            await asyncio.to_thread(summaries.started.wait, 10)
-            waiting, english = get("zh"), get("en")
-            for _arrival in range(3):
-                await spy.arrivals.get()
-            summaries.gate.set()
+            try:
+                await asyncio.to_thread(summaries.started.wait)
+                waiting, english = get("zh"), get("en")
+                for _arrival in range(3):
+                    await spy.arrivals.get()
+            finally:
+                # 断言失败时也放行闸门，不留阻塞的工作线程。
+                summaries.gate.set()
             responses = await asyncio.gather(running, waiting, english)
 
         def expected(locale):

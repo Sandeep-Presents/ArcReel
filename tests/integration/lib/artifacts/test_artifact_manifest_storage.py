@@ -658,6 +658,36 @@ def test_project_adapter_retries_removing_the_emptied_manifest_while_a_reader_ho
         assert not manifest_path.exists()
 
 
+def test_lock_free_read_retries_when_a_writer_replaces_the_manifest_mid_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without O_NOFOLLOW the open is bracketed by identity checks; a writer's replace in between is not a swap."""
+
+    project, _writer = _registered_script_project(tmp_path)
+    manifest_path = project / MANIFEST_FILENAME
+    reader = ProjectArtifactManifestAdapter(project, nofollow_supported=False)
+    reset_manifest_read_cache_for_tests()
+    original_open = os.open
+    replaced = False
+
+    def replace_then_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        nonlocal replaced
+        if not replaced and os.fsdecode(path) in {MANIFEST_FILENAME, os.fsdecode(manifest_path)}:
+            replaced = True
+            fresh = project / "fresh.tmp"
+            fresh.write_bytes(manifest_path.read_bytes())
+            os.replace(fresh, manifest_path)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("lib.artifacts.artifact_manifest.os.open", replace_then_open)
+
+    entry = reader.get_entry(ArtifactKey.episode_script(1))
+
+    assert replaced
+    assert entry is not None
+
+
 @pytest.mark.parametrize("force_python_link_fallback", [False, True])
 def test_project_adapter_blocks_escape_and_symlink_artifact_paths(
     tmp_path: Path,
